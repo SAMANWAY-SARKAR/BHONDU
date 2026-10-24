@@ -27,9 +27,8 @@ class PDFNotesApp extends StatelessWidget {
       title: 'BHONDU',
       theme: ThemeData(
         scaffoldBackgroundColor: AppColors.background,
-        textTheme: GoogleFonts.poppinsTextTheme(
-          Theme.of(context).textTheme,
-        ),
+        // REPLACE THE TEXTTHEME LINE WITH THIS:
+        fontFamily: GoogleFonts.poppins().fontFamily,
         iconTheme: const IconThemeData(color: AppColors.text),
       ),
       // The app now boots straight into the Splash Screen!

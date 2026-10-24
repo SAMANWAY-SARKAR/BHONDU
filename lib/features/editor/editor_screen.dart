@@ -1,10 +1,14 @@
 import 'dart:ui' as ui;
 import 'dart:io';
+import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:pdfx/pdfx.dart' as pdfx; // Using pdfx to render pages as backgrounds
 import '../../core/theme.dart';
 
 // ==========================================
@@ -32,12 +36,12 @@ class NotePage {
   List<Stroke> strokes = [];
   final PageType type;
   final double aspectRatio; 
-  final String? pdfBackgroundImagePath; 
+  final int? pdfPageNumber; // Tracks which page of the PDF this is
 
   NotePage({
     this.type = PageType.blank,
     this.aspectRatio = 1 / 1.414, 
-    this.pdfBackgroundImagePath,
+    this.pdfPageNumber,
   });
 }
 
@@ -64,6 +68,11 @@ class EditorScreen extends StatefulWidget {
 class _EditorScreenState extends State<EditorScreen> {
   List<NotePage> pages = []; 
   int currentPageIndex = 0;
+  bool isLoading = true;
+
+  // PDF Extraction Variables
+  pdfx.PdfDocument? _pdfDocument;
+  final Map<int, Uint8List> _pdfPageCache = {}; // Prevents OOM crashes by caching images
 
   final TransformationController _transformationController = TransformationController();
 
@@ -88,18 +97,117 @@ class _EditorScreenState extends State<EditorScreen> {
   @override
   void initState() {
     super.initState();
-    _initializePages();
+    _initializeDocument();
   }
 
-  void _initializePages() {
+  Future<void> _initializeDocument() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedData = prefs.getString('doc_${widget.documentId}');
+    
+    // 1. If it's a PDF, load the file into memory
     if (widget.isImportedPdf) {
-      pages = [
-        NotePage(type: PageType.pdf, aspectRatio: 16 / 9), 
-        NotePage(type: PageType.pdf, aspectRatio: 1 / 1.414), 
-      ];
+      try {
+        _pdfDocument = await pdfx.PdfDocument.openFile(widget.documentId);
+      } catch (e) {
+        debugPrint("Error opening PDF: $e");
+      }
+    }
+
+    // 2. Load existing save data if it exists
+    if (savedData != null) {
+      try {
+        final List<dynamic> decodedPages = jsonDecode(savedData);
+        pages = decodedPages.map((pageData) {
+          final NotePage p = NotePage(
+            type: pageData['type'] == 'pdf' ? PageType.pdf : PageType.blank,
+            aspectRatio: pageData['aspectRatio'],
+            pdfPageNumber: pageData['pdfPageNumber'],
+          );
+          
+          p.strokes = (pageData['strokes'] as List).map((strokeData) {
+            return Stroke(
+              tool: DrawingTool.values.firstWhere((e) => e.toString() == strokeData['tool']),
+              color: Color(strokeData['color']),
+              strokeWidth: strokeData['width'],
+              points: (strokeData['points'] as List).map((pt) => Offset(pt['dx'], pt['dy'])).toList(),
+            );
+          }).toList();
+          return p;
+        }).toList();
+      } catch (e) {
+        debugPrint("Error loading save data: $e");
+        _setupFreshDocument();
+      }
+    } else {
+      _setupFreshDocument();
+    }
+
+    setState(() { isLoading = false; });
+  }
+
+  void _setupFreshDocument() {
+    if (widget.isImportedPdf && _pdfDocument != null) {
+      // Create a NotePage for every single page in the PDF
+      int pageCount = _pdfDocument!.pagesCount;
+      pages = List.generate(pageCount, (index) {
+        return NotePage(
+          type: PageType.pdf,
+          aspectRatio: 1 / 1.414, 
+          pdfPageNumber: index + 1, // PDF pages are 1-indexed
+        );
+      });
     } else {
       pages = [NotePage(type: PageType.blank, aspectRatio: 1 / 1.414)];
     }
+  }
+
+  // Extracts the specific PDF page as an image to use as a background
+  Future<Uint8List?> _getPdfPageImage(int pageNumber) async {
+    if (_pdfPageCache.containsKey(pageNumber)) return _pdfPageCache[pageNumber];
+    if (_pdfDocument == null) return null;
+
+    try {
+      final page = await _pdfDocument!.getPage(pageNumber);
+      
+      // Render at 2x resolution and explicitly set the format to PNG
+      final pageImage = await page.render(
+        width: page.width * 2, 
+        height: page.height * 2,
+        format: pdfx.PdfPageImageFormat.png, 
+      );
+      
+      await page.close();
+
+      if (pageImage != null) {
+        _pdfPageCache[pageNumber] = pageImage.bytes;
+        return pageImage.bytes;
+      }
+    } catch (e) {
+      debugPrint("Error rendering PDF page: $e");
+    }
+    return null;
+  }
+
+  Future<void> _triggerAutoSave() async {
+    final prefs = await SharedPreferences.getInstance();
+    
+    final List<Map<String, dynamic>> serializedData = pages.map((page) {
+      return {
+        'type': page.type == PageType.pdf ? 'pdf' : 'blank',
+        'aspectRatio': page.aspectRatio,
+        'pdfPageNumber': page.pdfPageNumber,
+        'strokes': page.strokes.map((stroke) {
+          return {
+            'tool': stroke.tool.toString(),
+            'color': stroke.color.value,
+            'width': stroke.strokeWidth,
+            'points': stroke.points.map((pt) => {'dx': pt.dx, 'dy': pt.dy}).toList(),
+          };
+        }).toList(),
+      };
+    }).toList();
+
+    await prefs.setString('doc_${widget.documentId}', jsonEncode(serializedData));
   }
 
   // ==========================================
@@ -122,15 +230,11 @@ class _EditorScreenState extends State<EditorScreen> {
   }
   
   void _prevPage() {
-    if (currentPageIndex > 0) {
-      setState(() => currentPageIndex--);
-    }
+    if (currentPageIndex > 0) setState(() => currentPageIndex--);
   }
 
   void _nextPage() {
-    if (currentPageIndex < pages.length - 1) {
-      setState(() => currentPageIndex++);
-    }
+    if (currentPageIndex < pages.length - 1) setState(() => currentPageIndex++);
   }
 
   void _jumpToPage() {
@@ -164,13 +268,6 @@ class _EditorScreenState extends State<EditorScreen> {
                 if (page != null && page >= 1 && page <= pages.length) {
                   setState(() => currentPageIndex = page - 1);
                   Navigator.pop(context);
-                } else {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('Please enter a valid page number', style: const TextStyle(color: Colors.white)),
-                      backgroundColor: AppColors.secondary,
-                    ),
-                  );
                 }
               },
               child: const Text('Go', style: TextStyle(color: AppColors.primary, fontWeight: FontWeight.bold)),
@@ -181,25 +278,16 @@ class _EditorScreenState extends State<EditorScreen> {
     );
   }
 
-  // --- THE NEW PDF EXPORT LOGIC ---
   Future<void> _exportAndDownloadPDF() async {
-    // Show a loading message
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Generating PDF...', style: const TextStyle(color: Colors.white)),
-        backgroundColor: AppColors.primary,
-        behavior: SnackBarBehavior.floating,
-      ),
+      const SnackBar(content: Text('Generating PDF...', style: TextStyle(color: Colors.white)), backgroundColor: AppColors.primary, behavior: SnackBarBehavior.floating),
     );
 
     try {
       final pdf = pw.Document();
-
-      // Calculate how big the paper was on screen to perfectly map the drawing coordinates
       double screenPaperHeight = MediaQuery.of(context).size.height - 80; 
 
       for (var page in pages) {
-        // Determine PDF page size based on the page's aspect ratio (Default A4 is 595x841 pts)
         double pdfWidth = page.aspectRatio > 1 ? 841.89 : 595.27;
         double pdfHeight = page.aspectRatio > 1 ? 841.89 / page.aspectRatio : 595.27 / page.aspectRatio;
 
@@ -214,7 +302,6 @@ class _EditorScreenState extends State<EditorScreen> {
                   painter: (PdfGraphics canvas, PdfPoint size) {
                     
                     double screenPaperWidth = screenPaperHeight * page.aspectRatio;
-                    // Scaling factors to map screen pixels perfectly to PDF points
                     double scaleX = size.x / screenPaperWidth;
                     double scaleY = size.y / screenPaperHeight;
 
@@ -222,25 +309,20 @@ class _EditorScreenState extends State<EditorScreen> {
                       if (stroke.points.isEmpty) continue;
                       
                       canvas.saveContext();
-                      
-                      // Handle Tool Colors (Eraser draws white to "delete" ink on the PDF)
                       if (stroke.tool == DrawingTool.eraser) {
                         canvas.setStrokeColor(PdfColors.white); 
                       } else {
                         canvas.setStrokeColor(PdfColor.fromInt(stroke.color.value));
                       }
                       
-                      // Handle Highlighter Opacity
                       if (stroke.tool == DrawingTool.highlighter) {
                         canvas.setGraphicState(const PdfGraphicState(opacity: 0.4));
                       }
 
-                      // Apply Caps and Widths
                       canvas.setLineWidth(stroke.strokeWidth * scaleX);
                       canvas.setLineCap(stroke.tool == DrawingTool.highlighter ? PdfLineCap.square : PdfLineCap.round);
                       canvas.setLineJoin(stroke.tool == DrawingTool.highlighter ? PdfLineJoin.bevel : PdfLineJoin.round);
 
-                      // Draw the points! (PDF uses Bottom-Left origin, so we invert the Y axis)
                       canvas.moveTo(stroke.points.first.dx * scaleX, size.y - (stroke.points.first.dy * scaleY));
                       for (int i = 1; i < stroke.points.length; i++) {
                         canvas.lineTo(stroke.points[i].dx * scaleX, size.y - (stroke.points[i].dy * scaleY));
@@ -257,44 +339,23 @@ class _EditorScreenState extends State<EditorScreen> {
         );
       }
 
-      // Save the file to the Android Downloads folder
       Directory? directory;
-      if (Platform.isAndroid) {
-        directory = Directory('/storage/emulated/0/Download');
-      } else {
-        directory = await getApplicationDocumentsDirectory(); // Fallback for iOS/Desktop
-      }
+      if (Platform.isAndroid) directory = Directory('/storage/emulated/0/Download');
+      else directory = await getApplicationDocumentsDirectory(); 
 
-      // Clean the file name so it has no spaces or weird characters
       String cleanName = widget.documentName.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_');
       final File file = File('${directory.path}/${cleanName}_Notes.pdf');
-      
       await file.writeAsBytes(await pdf.save());
 
       if (mounted) {
         ScaffoldMessenger.of(context).hideCurrentSnackBar();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Saved successfully to Downloads!', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-            backgroundColor: Colors.green,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saved successfully to Downloads!', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)), backgroundColor: Colors.green, behavior: SnackBarBehavior.floating));
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error saving PDF: $e', style: const TextStyle(color: Colors.white)),
-            backgroundColor: AppColors.secondary,
-          ),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error saving PDF: $e', style: const TextStyle(color: Colors.white)), backgroundColor: AppColors.secondary));
       }
     }
-  }
-
-  void _triggerAutoSave() {
-    debugPrint("Auto-saved document at ${DateTime.now()}");
   }
 
   // ==========================================
@@ -336,6 +397,10 @@ class _EditorScreenState extends State<EditorScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (isLoading) {
+      return const Scaffold(backgroundColor: AppColors.background, body: Center(child: CircularProgressIndicator(color: AppColors.primary)));
+    }
+
     return Scaffold(
       backgroundColor: AppColors.background,
       body: SafeArea(
@@ -419,14 +484,24 @@ class _EditorScreenState extends State<EditorScreen> {
         ),
         child: ClipRect(
           child: Stack(
+            fit: StackFit.expand,
             children: [
-              if (page.type == PageType.pdf)
-                Center(
-                  child: Opacity(
-                    opacity: 0.1,
-                    child: Text("Imported PDF Page\nSize: ${page.aspectRatio.toStringAsFixed(2)}", textAlign: TextAlign.center, style: GoogleFonts.poppins(fontSize: 32, fontWeight: FontWeight.bold)),
-                  ),
+              // 1. RENDER PDF BACKGROUND IF IT IS A PDF PAGE
+              if (page.type == PageType.pdf && page.pdfPageNumber != null)
+                FutureBuilder<Uint8List?>(
+                  future: _getPdfPageImage(page.pdfPageNumber!),
+                  builder: (context, snapshot) {
+                    if (snapshot.connectionState == ConnectionState.waiting) {
+                      return const Center(child: CircularProgressIndicator(color: AppColors.primary));
+                    }
+                    if (snapshot.hasData && snapshot.data != null) {
+                      return Image.memory(snapshot.data!, fit: BoxFit.contain);
+                    }
+                    return const Center(child: Icon(Icons.error_outline, color: Colors.red));
+                  },
                 ),
+                
+              // 2. RENDER THE DRAWING CANVAS ON TOP
               GestureDetector(
                 onPanStart: _onPanStart,
                 onPanUpdate: _onPanUpdate,

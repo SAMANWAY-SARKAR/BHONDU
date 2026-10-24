@@ -114,7 +114,7 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
                         child: ScaleTransition(
                           scale: _scaleAnimation,
                           child: Text(
-                            'COGNIRE', 
+                            'BHONDU', 
                             style: GoogleFonts.poppins(
                               fontSize: 48,
                               fontWeight: FontWeight.bold,
