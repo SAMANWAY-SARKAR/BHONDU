@@ -1,7 +1,9 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:path_provider/path_provider.dart';
 import '../../core/theme.dart';
 import '../../data/database_helper.dart';
 import '../editor/editor_screen.dart';
@@ -35,24 +37,41 @@ class _SubjectDetailScreenState extends State<SubjectDetailScreen> {
   Future<void> _importPDF() async {
     try {
       FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.custom, allowedExtensions: ['pdf'],
+        type: FileType.custom,
+        allowedExtensions: ['pdf'],
+        withData: true,
       );
 
       if (result != null) {
-        String fileName = result.files.single.name;
-        String displayTitle = fileName.replaceAll('.pdf', '');
+        final pickedFile = result.files.single;
+        String fileName = pickedFile.name;
+        String displayTitle = fileName.replaceAll(RegExp(r'\.pdf$', caseSensitive: false), '');
 
         if (documents.any((doc) => doc['title'] == displayTitle)) {
-           _showDuplicateErrorDialog(displayTitle, isImport: true);
-           return;
+          _showDuplicateErrorDialog(displayTitle, isImport: true);
+          return;
+        }
+
+        // Copy the picked PDF to permanent app directory so the path always works
+        final appDir = await getApplicationDocumentsDirectory();
+        final String docId = DateTime.now().millisecondsSinceEpoch.toString();
+        final String savedPdfPath = '${appDir.path}/pdf_$docId.pdf';
+
+        if (pickedFile.path != null && await File(pickedFile.path!).exists()) {
+          await File(pickedFile.path!).copy(savedPdfPath);
+        } else if (pickedFile.bytes != null) {
+          await File(savedPdfPath).writeAsBytes(pickedFile.bytes!, flush: true);
+        } else {
+          return;
         }
 
         final newDoc = {
-          'id': DateTime.now().millisecondsSinceEpoch.toString(),
+          'id': docId,
           'subject_id': widget.subjectId,
           'title': displayTitle,
           'type': 'pdf',
           'date': DateFormat('MMM d, yyyy').format(DateTime.now()),
+          'pdf_path': savedPdfPath,
         };
 
         await DatabaseHelper.instance.insertDocument(newDoc);
@@ -218,6 +237,8 @@ class _SubjectDetailScreenState extends State<SubjectDetailScreen> {
                                 builder: (context) => EditorScreen(
                                   documentId: doc['id'],
                                   documentName: doc['title'],
+                                  isImportedPdf: doc['type'] == 'pdf',
+                                  pdfPath: doc['pdf_path'],
                                 ),
                               ),
                             );

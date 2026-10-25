@@ -151,6 +151,32 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  void _deleteFolder(String id, String name) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.background,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text('Delete $name?', style: GoogleFonts.poppins(color: AppColors.primary, fontWeight: FontWeight.bold)),
+        content: const Text('Are you sure? All files inside this chamber will be deleted.', style: TextStyle(color: AppColors.text)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel', style: TextStyle(color: AppColors.text)),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              await DatabaseHelper.instance.deleteSubject(id);
+              _refreshFolders();
+            },
+            child: const Text('Delete', style: TextStyle(color: AppColors.primary, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _openCustomCalendar() {
     showDialog(
       context: context,
@@ -249,6 +275,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         );
                       },
+                      onDelete: () => _deleteFolder(folders[index]['id'], folders[index]['name']),
                     );
                   },
                 ),
@@ -407,7 +434,8 @@ class SubjectCard extends StatefulWidget {
   final String name;
   final String emoji;
   final VoidCallback onTap;
-  const SubjectCard({Key? key, required this.name, required this.emoji, required this.onTap}) : super(key: key);
+  final VoidCallback? onDelete;
+  const SubjectCard({Key? key, required this.name, required this.emoji, required this.onTap, this.onDelete}) : super(key: key);
   @override
   State<SubjectCard> createState() => _SubjectCardState();
 }
@@ -440,6 +468,15 @@ class _SubjectCardState extends State<SubjectCard> with SingleTickerProviderStat
             children: [
               Positioned(right: -10, bottom: -10, child: Opacity(opacity: 0.15, child: Text(widget.emoji, style: const TextStyle(fontSize: 80)))),
               Padding(padding: const EdgeInsets.all(16.0), child: Align(alignment: Alignment.topLeft, child: Text(widget.name, style: GoogleFonts.poppins(fontSize: 18, fontWeight: FontWeight.w600, color: AppColors.text), maxLines: 3, overflow: TextOverflow.ellipsis))),
+              if (widget.onDelete != null)
+                Positioned(
+                  top: 5,
+                  right: 5,
+                  child: IconButton(
+                    icon: const Icon(Icons.delete_outline, color: AppColors.primary, size: 20),
+                    onPressed: widget.onDelete,
+                  ),
+                ),
             ],
           ),
         ),

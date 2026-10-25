@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pdfx/pdfx.dart' as pdfx; // Using pdfx to render pages as backgrounds
 import '../../core/theme.dart';
+import '../../data/database_helper.dart';
 
 // ==========================================
 // DATA MODELS
@@ -52,13 +53,15 @@ class NotePage {
 class EditorScreen extends StatefulWidget {
   final String documentId;
   final String documentName;
-  final bool isImportedPdf; 
+  final bool isImportedPdf;
+  final String? pdfPath;
 
   const EditorScreen({
     Key? key, 
     required this.documentId,
     this.documentName = 'New Blank Note',
     this.isImportedPdf = false,
+    this.pdfPath,
   }) : super(key: key);
 
   @override
@@ -73,6 +76,7 @@ class _EditorScreenState extends State<EditorScreen> {
   // PDF Extraction Variables
   pdfx.PdfDocument? _pdfDocument;
   final Map<int, Uint8List> _pdfPageCache = {}; // Prevents OOM crashes by caching images
+  final Map<int, Future<Uint8List?>> _pdfPageFutures = {}; // Prevents flickering while drawing over PDF
 
   final TransformationController _transformationController = TransformationController();
 
@@ -85,7 +89,7 @@ class _EditorScreenState extends State<EditorScreen> {
   
   Stroke? currentStroke;
 
-  final List<double> penSizes = [1.0, 2.0, 4.0, 6.0, 8.0, 10.0]; 
+  final List<double> penSizes = [1.0, 2.0, 4.0, 8.0, 10.0]; 
   final List<Color> penColors = [
     Colors.black, Colors.red, Colors.white, Colors.blue, Colors.yellow, 
     Colors.green, Colors.brown, Colors.pink, Colors.cyan, Colors.orange
@@ -100,14 +104,35 @@ class _EditorScreenState extends State<EditorScreen> {
     _initializeDocument();
   }
 
+  @override
+  void dispose() {
+    _pdfDocument?.close();
+    super.dispose();
+  }
+
   Future<void> _initializeDocument() async {
     final prefs = await SharedPreferences.getInstance();
     final savedData = prefs.getString('doc_${widget.documentId}');
-    
-    // 1. If it's a PDF, load the file into memory
-    if (widget.isImportedPdf) {
+
+    String? resolvedPath = widget.pdfPath;
+    bool isPdfDoc = widget.isImportedPdf;
+
+    // Fallback check in SQLite in case pdfPath wasn't passed directly
+    if (resolvedPath == null || resolvedPath.isEmpty) {
       try {
-        _pdfDocument = await pdfx.PdfDocument.openFile(widget.documentId);
+        final db = await DatabaseHelper.instance.database;
+        final rows = await db.query('documents', where: 'id = ?', whereArgs: [widget.documentId]);
+        if (rows.isNotEmpty) {
+          resolvedPath = rows.first['pdf_path'] as String?;
+          if (rows.first['type'] == 'pdf') isPdfDoc = true;
+        }
+      } catch (_) {}
+    }
+
+    // 1. If it's a PDF, load the file into memory using the actual file path
+    if (isPdfDoc && resolvedPath != null && resolvedPath.isNotEmpty) {
+      try {
+        _pdfDocument = await pdfx.PdfDocument.openFile(resolvedPath);
       } catch (e) {
         debugPrint("Error opening PDF: $e");
       }
@@ -120,7 +145,7 @@ class _EditorScreenState extends State<EditorScreen> {
         pages = decodedPages.map((pageData) {
           final NotePage p = NotePage(
             type: pageData['type'] == 'pdf' ? PageType.pdf : PageType.blank,
-            aspectRatio: pageData['aspectRatio'],
+            aspectRatio: (pageData['aspectRatio'] as num).toDouble(),
             pdfPageNumber: pageData['pdfPageNumber'],
           );
           
@@ -128,25 +153,32 @@ class _EditorScreenState extends State<EditorScreen> {
             return Stroke(
               tool: DrawingTool.values.firstWhere((e) => e.toString() == strokeData['tool']),
               color: Color(strokeData['color']),
-              strokeWidth: strokeData['width'],
-              points: (strokeData['points'] as List).map((pt) => Offset(pt['dx'], pt['dy'])).toList(),
+              strokeWidth: (strokeData['width'] as num).toDouble(),
+              points: (strokeData['points'] as List).map((pt) => Offset((pt['dx'] as num).toDouble(), (pt['dy'] as num).toDouble())).toList(),
             );
           }).toList();
           return p;
         }).toList();
+
+        // If this is a PDF document, but savedData was previously saved as a single blank page by mistake, rebuild all PDF pages
+        if (isPdfDoc && _pdfDocument != null && !pages.any((p) => p.type == PageType.pdf)) {
+          _setupFreshDocument();
+          await _triggerAutoSave();
+        }
       } catch (e) {
         debugPrint("Error loading save data: $e");
         _setupFreshDocument();
       }
     } else {
       _setupFreshDocument();
+      await _triggerAutoSave();
     }
 
     setState(() { isLoading = false; });
   }
 
   void _setupFreshDocument() {
-    if (widget.isImportedPdf && _pdfDocument != null) {
+    if (_pdfDocument != null) {
       // Create a NotePage for every single page in the PDF
       int pageCount = _pdfDocument!.pagesCount;
       pages = List.generate(pageCount, (index) {
@@ -159,6 +191,13 @@ class _EditorScreenState extends State<EditorScreen> {
     } else {
       pages = [NotePage(type: PageType.blank, aspectRatio: 1 / 1.414)];
     }
+  }
+
+  Future<Uint8List?> _getPdfPageFuture(int pageNumber) {
+    if (_pdfPageCache.containsKey(pageNumber)) {
+      return Future.value(_pdfPageCache[pageNumber]);
+    }
+    return _pdfPageFutures.putIfAbsent(pageNumber, () => _getPdfPageImage(pageNumber));
   }
 
   // Extracts the specific PDF page as an image to use as a background
@@ -228,6 +267,48 @@ class _EditorScreenState extends State<EditorScreen> {
     });
     _triggerAutoSave();
   }
+
+  void _deleteCurrentPage() {
+    if (pages.length <= 1) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Cannot delete the only page!', style: TextStyle(color: Colors.white)),
+          backgroundColor: AppColors.secondary,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.background,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text('Delete Page ${currentPageIndex + 1}?', style: GoogleFonts.poppins(color: AppColors.primary, fontWeight: FontWeight.bold)),
+        content: const Text('Are you sure you want to delete this page?', style: TextStyle(color: AppColors.text)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel', style: TextStyle(color: AppColors.text)),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              setState(() {
+                pages.removeAt(currentPageIndex);
+                if (currentPageIndex >= pages.length) {
+                  currentPageIndex = pages.length - 1;
+                }
+              });
+              _triggerAutoSave();
+            },
+            child: const Text('Delete', style: TextStyle(color: AppColors.primary, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
   
   void _prevPage() {
     if (currentPageIndex > 0) setState(() => currentPageIndex--);
@@ -291,48 +372,59 @@ class _EditorScreenState extends State<EditorScreen> {
         double pdfWidth = page.aspectRatio > 1 ? 841.89 : 595.27;
         double pdfHeight = page.aspectRatio > 1 ? 841.89 / page.aspectRatio : 595.27 / page.aspectRatio;
 
+        Uint8List? bgImageBytes;
+        if (page.type == PageType.pdf && page.pdfPageNumber != null) {
+          bgImageBytes = await _getPdfPageImage(page.pdfPageNumber!);
+        }
+
         pdf.addPage(
           pw.Page(
             pageFormat: PdfPageFormat(pdfWidth, pdfHeight),
             build: (pw.Context context) {
               return pw.FullPage(
                 ignoreMargins: true,
-                child: pw.CustomPaint(
-                  size: PdfPoint(pdfWidth, pdfHeight),
-                  painter: (PdfGraphics canvas, PdfPoint size) {
-                    
-                    double screenPaperWidth = screenPaperHeight * page.aspectRatio;
-                    double scaleX = size.x / screenPaperWidth;
-                    double scaleY = size.y / screenPaperHeight;
+                child: pw.Stack(
+                  fit: pw.StackFit.expand,
+                  children: [
+                    if (bgImageBytes != null)
+                      pw.Image(pw.MemoryImage(bgImageBytes), fit: pw.BoxFit.contain),
+                    pw.CustomPaint(
+                      size: PdfPoint(pdfWidth, pdfHeight),
+                      painter: (PdfGraphics canvas, PdfPoint size) {
+                        double screenPaperWidth = screenPaperHeight * page.aspectRatio;
+                        double scaleX = size.x / screenPaperWidth;
+                        double scaleY = size.y / screenPaperHeight;
 
-                    for (var stroke in page.strokes) {
-                      if (stroke.points.isEmpty) continue;
-                      
-                      canvas.saveContext();
-                      if (stroke.tool == DrawingTool.eraser) {
-                        canvas.setStrokeColor(PdfColors.white); 
-                      } else {
-                        canvas.setStrokeColor(PdfColor.fromInt(stroke.color.value));
-                      }
-                      
-                      if (stroke.tool == DrawingTool.highlighter) {
-                        canvas.setGraphicState(const PdfGraphicState(opacity: 0.4));
-                      }
+                        for (var stroke in page.strokes) {
+                          if (stroke.points.isEmpty) continue;
+                          
+                          canvas.saveContext();
+                          if (stroke.tool == DrawingTool.eraser) {
+                            canvas.setStrokeColor(PdfColors.white); 
+                          } else {
+                            canvas.setStrokeColor(PdfColor.fromInt(stroke.color.value));
+                          }
+                          
+                          if (stroke.tool == DrawingTool.highlighter) {
+                            canvas.setGraphicState(const PdfGraphicState(opacity: 0.4));
+                          }
 
-                      canvas.setLineWidth(stroke.strokeWidth * scaleX);
-                      canvas.setLineCap(stroke.tool == DrawingTool.highlighter ? PdfLineCap.square : PdfLineCap.round);
-                      canvas.setLineJoin(stroke.tool == DrawingTool.highlighter ? PdfLineJoin.bevel : PdfLineJoin.round);
+                          canvas.setLineWidth(stroke.strokeWidth * scaleX);
+                          canvas.setLineCap(stroke.tool == DrawingTool.highlighter ? PdfLineCap.square : PdfLineCap.round);
+                          canvas.setLineJoin(stroke.tool == DrawingTool.highlighter ? PdfLineJoin.bevel : PdfLineJoin.round);
 
-                      canvas.moveTo(stroke.points.first.dx * scaleX, size.y - (stroke.points.first.dy * scaleY));
-                      for (int i = 1; i < stroke.points.length; i++) {
-                        canvas.lineTo(stroke.points[i].dx * scaleX, size.y - (stroke.points[i].dy * scaleY));
-                      }
-                      
-                      canvas.strokePath();
-                      canvas.restoreContext();
-                    }
-                  }
-                )
+                          canvas.moveTo(stroke.points.first.dx * scaleX, size.y - (stroke.points.first.dy * scaleY));
+                          for (int i = 1; i < stroke.points.length; i++) {
+                            canvas.lineTo(stroke.points[i].dx * scaleX, size.y - (stroke.points[i].dy * scaleY));
+                          }
+                          
+                          canvas.strokePath();
+                          canvas.restoreContext();
+                        }
+                      },
+                    ),
+                  ],
+                ),
               );
             }
           )
@@ -436,6 +528,8 @@ class _EditorScreenState extends State<EditorScreen> {
                 children: [
                   _buildCircleButton(Icons.add, _addNewPage),
                   const SizedBox(height: 16),
+                  _buildCircleButton(Icons.delete_outline, _deleteCurrentPage),
+                  const SizedBox(height: 16),
                   _buildCircleButton(Icons.download, _exportAndDownloadPDF),
                   const SizedBox(height: 16),
                   _buildCircleButton(Icons.search, _jumpToPage),
@@ -489,13 +583,17 @@ class _EditorScreenState extends State<EditorScreen> {
               // 1. RENDER PDF BACKGROUND IF IT IS A PDF PAGE
               if (page.type == PageType.pdf && page.pdfPageNumber != null)
                 FutureBuilder<Uint8List?>(
-                  future: _getPdfPageImage(page.pdfPageNumber!),
+                  future: _getPdfPageFuture(page.pdfPageNumber!),
                   builder: (context, snapshot) {
-                    if (snapshot.connectionState == ConnectionState.waiting) {
+                    if (snapshot.connectionState == ConnectionState.waiting && !snapshot.hasData) {
                       return const Center(child: CircularProgressIndicator(color: AppColors.primary));
                     }
                     if (snapshot.hasData && snapshot.data != null) {
-                      return Image.memory(snapshot.data!, fit: BoxFit.contain);
+                      return Image.memory(
+                        snapshot.data!,
+                        fit: BoxFit.contain,
+                        gaplessPlayback: true,
+                      );
                     }
                     return const Center(child: Icon(Icons.error_outline, color: Colors.red));
                   },
