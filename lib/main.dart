@@ -4,7 +4,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'core/theme.dart';
 import 'features/onboarding/splash_screen.dart';
 import 'core/notification_service.dart'; // 1. Add this import
-
+import 'package:flutter/foundation.dart';
 void main() async {
   // 2. We need this line because we are running async code before runApp()
   WidgetsFlutterBinding.ensureInitialized(); 
@@ -12,7 +12,9 @@ void main() async {
   // 3. Initialize the notifications and schedule the next 48 hours!
   final notificationService = NotificationService();
   await notificationService.init();
-  await notificationService.scheduleHourlyMotivation();
+  if (!kIsWeb) {
+  await NotificationService().scheduleHourlyMotivation();
+}
 
   runApp(const PDFNotesApp());
 }

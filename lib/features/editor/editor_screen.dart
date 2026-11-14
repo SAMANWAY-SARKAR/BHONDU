@@ -80,6 +80,10 @@ class _EditorScreenState extends State<EditorScreen> {
 
   final TransformationController _transformationController = TransformationController();
 
+  // Multi-touch tracking: 1 finger = Draw, 2+ fingers = Zoom & Pan
+  int _activePointers = 0;
+  bool _isTwoFingerGesture = false;
+
   DrawingTool activeTool = DrawingTool.pen;
   Color activePenColor = Colors.black;
   Color activeHighlighterColor = Colors.yellow;
@@ -107,6 +111,7 @@ class _EditorScreenState extends State<EditorScreen> {
   @override
   void dispose() {
     _pdfDocument?.close();
+    _transformationController.dispose();
     super.dispose();
   }
 
@@ -451,17 +456,27 @@ class _EditorScreenState extends State<EditorScreen> {
   }
 
   // ==========================================
-  // DRAWING GESTURES
+  // DRAWING & MULTI-TOUCH GESTURES
   // ==========================================
 
-  void _onPanStart(DragStartDetails details) {
+  void _handlePointerDown(PointerDownEvent event) {
+    if (_isTwoFingerGesture || _activePointers >= 2) {
+      // If a second finger touches down right after the first, remove the tiny accidental dot
+      if (currentStroke != null && currentStroke!.points.length <= 3) {
+        pages[currentPageIndex].strokes.remove(currentStroke);
+      }
+      currentStroke = null;
+      setState(() {});
+      return;
+    }
+
     setState(() {
       double calculatedWidth = activeTool == DrawingTool.eraser 
           ? activeEraserSize 
           : activeTool == DrawingTool.highlighter ? (activePenSize * 3.0) : activePenSize;
 
       currentStroke = Stroke(
-        points: [details.localPosition],
+        points: [event.localPosition],
         color: activeTool == DrawingTool.highlighter 
             ? activeHighlighterColor.withOpacity(0.3) 
             : activeTool == DrawingTool.eraser ? Colors.transparent : activePenColor,
@@ -472,15 +487,30 @@ class _EditorScreenState extends State<EditorScreen> {
     });
   }
 
-  void _onPanUpdate(DragUpdateDetails details) {
-    setState(() {
-      currentStroke?.points.add(details.localPosition);
-    });
+  void _handlePointerMove(PointerMoveEvent event) {
+    if (_isTwoFingerGesture || _activePointers >= 2) {
+      if (currentStroke != null) {
+        if (currentStroke!.points.length <= 3) {
+          pages[currentPageIndex].strokes.remove(currentStroke);
+        }
+        currentStroke = null;
+        setState(() {});
+      }
+      return;
+    }
+
+    if (currentStroke != null) {
+      setState(() {
+        currentStroke!.points.add(event.localPosition);
+      });
+    }
   }
 
-  void _onPanEnd(DragEndDetails details) {
-    currentStroke = null;
-    _triggerAutoSave(); 
+  void _handlePointerUpOrCancel(PointerEvent event) {
+    if (currentStroke != null) {
+      currentStroke = null;
+      _triggerAutoSave();
+    }
   }
 
   // ==========================================
@@ -498,15 +528,43 @@ class _EditorScreenState extends State<EditorScreen> {
       body: SafeArea(
         child: Stack(
           children: [
-            GestureDetector(
-              onDoubleTap: _handleDoubleTapZoom,
-              child: InteractiveViewer(
-                transformationController: _transformationController,
-                minScale: 0.5,
-                maxScale: 4.0,
-                boundaryMargin: const EdgeInsets.all(double.infinity),
-                child: Center(
-                  child: _buildDynamicPage(pages[currentPageIndex]), 
+            Listener(
+              onPointerDown: (_) {
+                _activePointers++;
+                if (_activePointers >= 2 && !_isTwoFingerGesture) {
+                  setState(() {
+                    _isTwoFingerGesture = true;
+                    if (currentStroke != null && currentStroke!.points.length <= 3) {
+                      pages[currentPageIndex].strokes.remove(currentStroke);
+                    }
+                    currentStroke = null;
+                  });
+                }
+              },
+              onPointerUp: (_) {
+                _activePointers = (_activePointers - 1).clamp(0, 10);
+                if (_activePointers == 0 && _isTwoFingerGesture) {
+                  setState(() => _isTwoFingerGesture = false);
+                }
+              },
+              onPointerCancel: (_) {
+                _activePointers = (_activePointers - 1).clamp(0, 10);
+                if (_activePointers == 0 && _isTwoFingerGesture) {
+                  setState(() => _isTwoFingerGesture = false);
+                }
+              },
+              child: GestureDetector(
+                onDoubleTap: _handleDoubleTapZoom,
+                child: InteractiveViewer(
+                  transformationController: _transformationController,
+                  panEnabled: _isTwoFingerGesture,
+                  scaleEnabled: true,
+                  minScale: 0.5,
+                  maxScale: 4.0,
+                  boundaryMargin: const EdgeInsets.all(double.infinity),
+                  child: Center(
+                    child: _buildDynamicPage(pages[currentPageIndex]), 
+                  ),
                 ),
               ),
             ),
@@ -599,11 +657,13 @@ class _EditorScreenState extends State<EditorScreen> {
                   },
                 ),
                 
-              // 2. RENDER THE DRAWING CANVAS ON TOP
-              GestureDetector(
-                onPanStart: _onPanStart,
-                onPanUpdate: _onPanUpdate,
-                onPanEnd: _onPanEnd,
+              // 2. RENDER THE DRAWING CANVAS ON TOP (1 finger draws, 2 fingers pass through to InteractiveViewer)
+              Listener(
+                behavior: HitTestBehavior.opaque,
+                onPointerDown: _handlePointerDown,
+                onPointerMove: _handlePointerMove,
+                onPointerUp: _handlePointerUpOrCancel,
+                onPointerCancel: _handlePointerUpOrCancel,
                 child: CustomPaint(size: Size.infinite, painter: DrawingPainter(strokes: page.strokes)),
               ),
             ],
